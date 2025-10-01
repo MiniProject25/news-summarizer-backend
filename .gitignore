@@ -206,3 +206,4 @@ __marimo__/
 .streamlit/secrets.toml
 
 info.md
+/src/models
