@@ -1,10 +1,14 @@
 from fastapi import HTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import Response
 from util.auth import verifyAccessToken
 
 class AuthMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request, call_next):
+        if request.method == "OPTIONS": # preflight pass
+            return Response(status_code=200)
+
         # list of unprotected routes
         skipMid = ["/api/user/login", "/api/user/register"]
 

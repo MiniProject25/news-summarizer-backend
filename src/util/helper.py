@@ -16,18 +16,49 @@ MODEL_PATH = str(RELATIVE_MODEL_PATH.resolve())
 summarizer = pipeline("summarization", model=MODEL_PATH, tokenizer=MODEL_PATH, framework="pt")
 
 ## remove unnecessary article meta-data
+import re
+
 def clean_article(text: str) -> str:
-    if not isinstance(text, str):
+    if not isinstance(text, str) or not text.strip():
         return ""
 
-    # Remove datelines (e.g., "TOKYO, JAPAN - SEPTEMBER 30:")
-    text = re.sub(r"^[A-Z\s,]+-\s*\w+\s*\d{1,2}:", "", text.strip())
+    # --- Remove invisible and control characters ---
+    text = re.sub(r'[\u200B-\u200D\uFEFF]', '', text)
 
-    text = re.sub(r"\((Photo by|AP Photo).*?\)", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"Copyright \d{4}.*?All rights reserved\.", "", text, flags=re.IGNORECASE)
+    # --- Remove typical newswire datelines, e.g., "TOKYO, JAPAN - SEPTEMBER 30:" ---
+    text = re.sub(
+        r"^[A-Z\s,]+-\s*(January|February|March|April|May|June|July|August|September|October|November|December)?"
+        r"\s*\d{0,2}[:,]?\s*",
+        "",
+        text.strip()
+    )
+
+    # --- Remove “By AUTHOR” or “By John Doe, Reuters” ---
+    text = re.sub(r"^By\s+[A-Z][A-Za-z\s\.,'-]{1,80}\n?", "", text, flags=re.IGNORECASE | re.MULTILINE)
+
+    # --- Remove parenthetical photo or agency credits ---
+    text = re.sub(r"\((Photo by|AP Photo|Getty Images|File|Reuters|Associated Press).*?\)", "", text, flags=re.IGNORECASE)
+
+    # --- Remove email addresses ---
+    text = re.sub(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", "", text)
+
+    # --- Remove publication timestamps ---
+    text = re.sub(r"Published\s*[:\-–]\s*[A-Z][a-z]{2,8}\s+\d{1,2},\s+\d{4}.*?(AM|PM)?", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"Updated\s*[:\-–].*?\d{4}.*?(AM|PM)?", "", text, flags=re.IGNORECASE)
+
+    # --- Remove copyright and redistribution disclaimers ---
+    text = re.sub(r"Copyright\s*©?\s*\d{4}.*?(All rights reserved\.?)", "", text, flags=re.IGNORECASE)
     text = re.sub(r"This material may not be published.*?(redistributed\.)?", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"(MORE FOR YOU:|Related:).*", "", text, flags=re.IGNORECASE)
+
+    # --- Remove “MORE FOR YOU”, “Related:”, “Recommended” sections ---
+    text = re.sub(r"(MORE FOR YOU|Related|Recommended|Read more):.*", "", text, flags=re.IGNORECASE)
+
+    # --- Remove common editorial suffixes like “___ contributed reporting” ---
+    text = re.sub(r"[A-Z][A-Za-z\s,]+contributed to this report\.", "", text, flags=re.IGNORECASE)
+
+    # --- Remove long runs of whitespace and normalize punctuation spacing ---
     text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"\s([?.!,;:])", r"\1", text)
 
     return text.strip()
 
@@ -57,7 +88,7 @@ def summarize_text(body: str, max_chunk_tokens=512) -> str:
     partial_summaries = []
     for chunk in chunks:
         if not chunk: continue
-        summary = summarizer(chunk, max_new_tokens=150, min_length=40, do_sample=False)[0]["summary_text"]
+        summary = summarizer(chunk, max_new_tokens=200, min_length=40, do_sample=False)[0]["summary_text"]
         partial_summaries.append(summary)
     
     # 4. Combine and perform the final summarization
@@ -66,7 +97,7 @@ def summarize_text(body: str, max_chunk_tokens=512) -> str:
     if not combined:
         return ""
 
-    final = summarizer(combined, max_new_tokens=120, min_length=50, do_sample=False)[0]["summary_text"]
+    final = summarizer(combined, max_new_tokens=150, min_length=50, do_sample=False)[0]["summary_text"]
     
     # 5. Format the final output
     final_sentences = sent_tokenize(final)

@@ -15,7 +15,7 @@ import asyncio
 router = APIRouter()
 
 ## get articles based on search
-@router.get("/articles/", response_model=ArticleSchema)
+@router.get("/articles/")
 def getAllArticles(
     search: str = Query(None, description="Search Article"), 
     db: Session = Depends(get_db)
@@ -53,7 +53,7 @@ def getAllArticles(
             "center_bias" : article.center_bias,
             "created_at" : article.created_at,
             "views" : article.views,
-            "sources" : article.references,
+            "sources" : article.sources,
         })
 
     return result

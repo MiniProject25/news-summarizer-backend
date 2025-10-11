@@ -13,7 +13,8 @@ from api.index import router as api_router
 # create all tables defined in userModel (defined by SQLAlchemy)
 
 origins = [
-    "http://localhost:3000"
+    "http://localhost:3000",
+    "http://127.0.0.1:3000"
 ]
 
 # applying rate limit to the backend
