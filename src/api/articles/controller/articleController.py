@@ -58,6 +58,19 @@ def getAllArticles(
 
     return result
 
+## get individual article details
+@router.get("/{id}")
+def getArticleById(id: int, db: Session = Depends(get_db)):
+    try:
+        article = db.query(Article).filter(Article.article_id == id).first()
+
+        if article is None:
+            raise HTTPException(status_code=404, detail="Article not found")
+        
+        return article
+    except Exception as e:
+        print(f"Error: {e}")
+
 ## scrape articles from multiple rss feeds
 ## to be run as a periodic job
 
@@ -107,12 +120,17 @@ async def scrapeArticles(
                     date_tuple = entry.published_parsed
                     article_pubdate = datetime.datetime.fromtimestamp(time.mktime(date_tuple))
 
-                news.download()
-                news.parse()
+                try:
+                    news.download()
+                    news.parse()
+                except Exception as e:
+                    print(f"Skipping {entry.link}: parse failed ({e})")
+                    continue
 
                 body = await asyncio.to_thread(lambda: news.text.strip())
 
                 if not body:
+                    print(f"Empty body for {entry.link}")
                     continue
                 
                 # clean article body
@@ -144,6 +162,9 @@ async def scrapeArticles(
                 else:                    
                     # summarize the body
                     summary = await asyncio.to_thread(summarize_text, body)
+
+                    if not summary.strip() or len(summary.split()) < 5:
+                        summary = "No summary available for this article."
 
                     new_article = Article(
                         title=entry.title,
@@ -190,3 +211,17 @@ async def scrapeArticles(
 ## Strategy to resolve this,
 # make the route synchronous
 # use asyncio library to use concurrency
+
+@router.post("/{article_id}/increment_view")
+def increment_views(article_id: int, db: Session = Depends(get_db)):
+    article = db.query(Article).filter(Article.article_id == article_id).first()
+    if not article:
+        db.close()
+        raise HTTPException(status_code=404, detail="Article not found")
+
+    article.views += 1
+    db.commit()
+    db.refresh(article)
+    db.close()
+
+    return {"article_id": article_id, "views": article.views}
