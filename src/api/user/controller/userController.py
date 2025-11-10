@@ -70,4 +70,7 @@ def login(user: UserLogin, response: Response, db: Session = Depends(get_db)):
 
     return {"message" : "Sucessfully logged In!", "token": token}
 
-    
+@router.get("/logout")
+def logout(response: Response):
+    response.delete_cookie("access_token")
+    return {"message": "Successfully logged out"}

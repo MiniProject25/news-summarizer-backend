@@ -1,6 +1,9 @@
+import logging
+from typing import Any, Dict, List
 import feedparser
+import httpx
 from newspaper import Article as NewsArticle, Config
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from transformers import pipeline
 from api.articles.model.articleModel import Article, ArticleReference
 from config.database import get_db
@@ -9,10 +12,12 @@ from sqlalchemy import or_
 from schemas.schemas import ArticleSchema
 import datetime
 import time
+import os
 from util.helper import clean_article, compute_hash, summarize_text
+from util.articleHelper import send_to_rag_service
 import asyncio
 
-router = APIRouter()
+router = APIRouter() 
 
 ## get articles based on search
 @router.get("/articles/")
@@ -57,20 +62,6 @@ def getAllArticles(
         })
 
     return result
-
-## get individual article details
-@router.get("/{id}")
-def getArticleById(id: int, db: Session = Depends(get_db)):
-    try:
-        article = db.query(Article).filter(Article.article_id == id).first()
-
-        if article is None:
-            raise HTTPException(status_code=404, detail="Article not found")
-        
-        return article
-    except Exception as e:
-        print(f"Error: {e}")
-
 ## scrape articles from multiple rss feeds
 ## to be run as a periodic job
 
@@ -83,7 +74,9 @@ def getArticleById(id: int, db: Session = Depends(get_db)):
 
 @router.get("/scrape")
 async def scrapeArticles(
-    db: Session = Depends(get_db)
+    limit: int = 2, # for the purpose of smoke test
+    db: Session = Depends(get_db),
+    background_tasks: BackgroundTasks = None
 ):
     feeds = {
         # "Bloomberg" : { "url" : "https://www.bloomberg.com/feed/podcast/etf-report.xml", "bias" : "left" },
@@ -106,11 +99,16 @@ async def scrapeArticles(
     )
     config.request_timeout = 10
 
+    count = 0  # smoke test
     ## fetch articles from the rss feeds of various sources
     for source, info in feeds.items():
         feed = feedparser.parse(info["url"])
 
-        for entry in feed.entries:  
+        for entry in feed.entries:
+
+            if count >= limit:
+                return {"message" : f"Scrape completed for {count} articles"}
+
             try:
                 # fetch article body
                 news = NewsArticle(entry.link, config=config)
@@ -132,9 +130,15 @@ async def scrapeArticles(
                 if not body:
                     print(f"Empty body for {entry.link}")
                     continue
+
+                print("Body before Cleaning: ")
+                print(body)
                 
                 # clean article body
                 body = clean_article(news.text)
+
+                print("Body after cleaning: ")
+                print(body)
 
                 # deduplication check
                 content_hash = compute_hash(body)
@@ -181,6 +185,22 @@ async def scrapeArticles(
                     db.commit()
                     db.refresh(new_article)
 
+                    article_pubdate = None
+                    if hasattr(entry, "published_parsed") and entry.published_parsed:
+                        date_tuple = entry.published_parsed
+                        article_pubdate = datetime.datetime.fromtimestamp(time.mktime(date_tuple))
+
+                    # send to RAG service for generating embeddings
+                    background_tasks.add_task(
+                        send_to_rag_service,
+                        new_article.article_id,
+                        body,
+                        entry.title,
+                        entry.link,
+                        new_article.category,
+                        str(article_pubdate)
+                    )
+
                     new_ref = ArticleReference(
                         article_id=new_article.article_id,
                         source_url=entry.link,
@@ -196,8 +216,60 @@ async def scrapeArticles(
             except Exception as e:
                 print(f"Error scraping {entry.link}: {e}")
                 continue
+
+            count += 1
     
     return {"message" : "Scraping completed"}
+
+## get list of article details
+@router.get("/details")
+def getArticlesByIds(
+    ids: str = Query(..., description="Comma-separated list of article IDs"),
+    db: Session = Depends(get_db)
+) -> List[Dict[str, Any]]:
+    try:
+        # Split on commas and convert to integers
+        id_list = [int(x) for x in ids.split(",") if x.strip().isdigit()]
+        
+        if not id_list:
+            raise HTTPException(status_code=400, detail="No valid article IDs provided")
+        
+        articles = db.query(Article).filter(Article.article_id.in_(id_list)).all()
+
+        if not articles:
+            raise HTTPException(status_code=404, detail="Articles not found")
+        
+        related_articles_data = []
+        for article in articles:
+            related_articles_data.append({
+                # Map DB fields to frontend fields
+                "id": str(article.article_id), 
+                "title": article.title,
+                # Assuming your Article model has a field for the URL path
+                "url": f"/Home/{article.article_id}" # <-- Use your app's internal URL structure
+            })
+
+        return related_articles_data
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid ID format provided")
+    except Exception as e:
+        print(f"Error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+## get individual article details
+@router.get("/{id}")
+def getArticleById(id: int, db: Session = Depends(get_db)):
+    try:
+        article = db.query(Article).filter(Article.article_id == id).first()
+
+        if article is None:
+            raise HTTPException(status_code=404, detail="Article not found")
+        
+        return article
+    except Exception as e:
+        print(f"Error: {e}")
+
+
 
 ## Handling blocking operations 
 # in the above route, 
@@ -212,6 +284,8 @@ async def scrapeArticles(
 # make the route synchronous
 # use asyncio library to use concurrency
 
+
+## ROUTE to increment article view count
 @router.post("/{article_id}/increment_view")
 def increment_views(article_id: int, db: Session = Depends(get_db)):
     article = db.query(Article).filter(Article.article_id == article_id).first()
@@ -225,3 +299,15 @@ def increment_views(article_id: int, db: Session = Depends(get_db)):
     db.close()
 
     return {"article_id": article_id, "views": article.views}
+
+
+## ROUTE to perform similarity search through RAG microservice
+@router.get("/similar-articles/{article_id}")
+async def get_similar_articles(article_id: int, n: int = 5):
+    async with httpx.AsyncClient() as client:
+        try:
+            r = await client.post(f"{os.getenv("RAG_URL")}/query", json={"id": str(article_id), "top_k": n})
+            return r.json()
+        except Exception as e:
+            logging.exception("Failed to fetch similar articles")
+            return {"error": str(e)}

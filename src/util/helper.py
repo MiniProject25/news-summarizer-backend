@@ -20,6 +20,7 @@ def compute_hash(text: str) -> str:
 
 CACHE_DIR = Path(__file__).parent / "cache"
 CACHE_DIR.mkdir(exist_ok=True)
+RAG_URL=""
 
 def cache_path(name: str) -> Path:
     return CACHE_DIR / f"{name}.json"
@@ -160,17 +161,20 @@ def is_relevant(article: str, sentence: str, min_sim: float = 0.45) -> bool:
 #  SUMMARIZATION
 # =====================================================
 
-def summarize_text(body: str, max_chunk_tokens=512) -> str:
-    """Generates 3–6 factual, coherent, non-redundant bullet points."""
+def summarize_text(body: str) -> str:
+    """Generates a clean, factual paragraph summary."""
+    if not summarizer:
+        return "Model not loaded"
+
     body = clean_article(body)
     if not body:
         return ""
 
-    # ---- Chunking ----
+    # --- Chunking: break only if absolutely necessary ---
     sentences = sent_tokenize(body)
     chunks, current_chunk = [], ""
     for s in sentences:
-        if len(current_chunk) + len(s) < max_chunk_tokens * 4:
+        if len(current_chunk.split()) + len(s.split()) < 450:  # ~512 token cap
             current_chunk += " " + s
         else:
             chunks.append(current_chunk.strip())
@@ -178,45 +182,27 @@ def summarize_text(body: str, max_chunk_tokens=512) -> str:
     if current_chunk:
         chunks.append(current_chunk.strip())
 
-    # ---- Summarize each chunk ----
+    # --- Summarize each chunk ---
     partials = []
     for ch in chunks:
         summary = summarizer(
-            ch, max_new_tokens=90, min_length=30, do_sample=False, truncation=True
-        )[0]["summary_text"]
-        partials.append(summary.strip())
+            ch,
+            max_length=200,       # same as model.generate max_length
+            min_length=60,        # same as model.generate min_length
+            num_beams=4,          # beam search width
+            length_penalty=2.0,   # discourage very long outputs
+            early_stopping=True,  # stop when beams end
+            do_sample=False       # deterministic, same as beam search
+        )[0]["summary_text"].strip()
+        partials.append(summary)
 
-    # ---- Merge & clean ----
+    # --- Merge summaries into one coherent paragraph ---
     combined = " ".join(partials)
     combined = re.sub(r"\s+", " ", combined).strip()
 
-    # ---- Split into potential bullet points ----
     bullets = re.split(r'(?<=[.!?])\s+', combined)
-    bullets = [b.strip() for b in bullets if 5 < len(b.split()) < 40]
-
-    # ---- Deduplicate & filter junk ----
-    seen, cleaned = set(), []
-    for b in bullets:
-        b_lower = b.lower()
-        if any(x in b_lower for x in ["getty", "photo", "note to user", "copyright", "courtesy", "file photo"]):
-            continue
-        if b_lower in seen:
-            continue
-        seen.add(b_lower)
-        b = re.sub(r"\b([A-Za-z]+) \1\b", r"\1", b)
-        b = re.sub(r"\s+", " ", b).strip(" -")
-        cleaned.append(b)
-
-    # ---- Quality filters ----
-    final_bullets = []
-    for b in cleaned[:10]:
-        if is_factually_supported(body, b) and is_relevant(body, b):
-            final_bullets.append(b)
-
-    final_bullets = final_bullets[:6]
-    if not final_bullets:
-        return ""
-    return "\n- " + "\n- ".join(final_bullets)
+    bullets = [b.strip() for b in bullets if len(b.split()) > 5]
+    return "\n- " + "\n- ".join(bullets[:5])
 
 # =====================================================
 #  SAFE EXIT HOOK — Auto-save cache
