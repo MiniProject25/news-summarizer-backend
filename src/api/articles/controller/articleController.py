@@ -13,8 +13,9 @@ from schemas.schemas import ArticleSchema
 import datetime
 import time
 import os
-from util.helper import clean_article, compute_hash, summarize_text
-from util.articleHelper import send_to_rag_service
+from util.deduplication_check import fast_duplicate_check
+from util.helper import clean_article_max_strict, compute_hash, summarize_text
+from util.articleHelper import categorize, send_to_rag_service
 import asyncio
 
 router = APIRouter() 
@@ -74,7 +75,7 @@ def getAllArticles(
 
 @router.get("/scrape")
 async def scrapeArticles(
-    limit: int = 2, # for the purpose of smoke test
+    limit: int = 4, # for the purpose of smoke test
     db: Session = Depends(get_db),
     background_tasks: BackgroundTasks = None
 ):
@@ -109,6 +110,8 @@ async def scrapeArticles(
             if count >= limit:
                 return {"message" : f"Scrape completed for {count} articles"}
 
+            count += 1
+            
             try:
                 # fetch article body
                 news = NewsArticle(entry.link, config=config)
@@ -131,93 +134,33 @@ async def scrapeArticles(
                     print(f"Empty body for {entry.link}")
                     continue
 
-                print("Body before Cleaning: ")
-                print(body)
+                # print("Body before Cleaning: ")
+                # print(body)
                 
                 # clean article body
-                body = clean_article(news.text)
+                body = clean_article_max_strict(news.text)
 
-                print("Body after cleaning: ")
-                print(body)
+                # print("Body after cleaning: ")
+                # print(body)
 
-                # deduplication check
-                content_hash = compute_hash(body)
-                existing_article = db.query(Article).filter(Article.content_hash == content_hash).first()
+                category = await categorize(body)
 
-                if existing_article:
-                    # update bias_count
-                    if info["bias"] == "left":
-                        existing_article.left_bias += 1
-                    if info["bias"] == "center":
-                        existing_article.center_bias += 1
-                    if info["bias"] == "right":
-                        existing_article.right_bias += 1
-
-                    # add a new reference
-                    new_ref = ArticleReference(
-                        article_id=existing_article.article_id,
-                        source_url=entry.link,
-                        published_date=article_pubdate,
-                        source_name=source,
-                        bias=info["bias"]
-                    )
-
-                    db.add(new_ref)
-                else:                    
-                    # summarize the body
-                    summary = await asyncio.to_thread(summarize_text, body)
-
-                    if not summary.strip() or len(summary.split()) < 5:
-                        summary = "No summary available for this article."
-
-                    new_article = Article(
-                        title=entry.title,
-                        summary=summary,
-                        category="finance", # for now
-                        image_url=news.top_image,
-                        left_bias=1 if info["bias"] == "left" else 0,
-                        center_bias=1 if info["bias"] == "center" else 0,
-                        right_bias=1 if info["bias"] == "right" else 0,
-                        content_hash=content_hash
-                    )
-
-                    db.add(new_article)
-                    db.commit()
-                    db.refresh(new_article)
-
-                    article_pubdate = None
-                    if hasattr(entry, "published_parsed") and entry.published_parsed:
-                        date_tuple = entry.published_parsed
-                        article_pubdate = datetime.datetime.fromtimestamp(time.mktime(date_tuple))
-
-                    # send to RAG service for generating embeddings
-                    background_tasks.add_task(
-                        send_to_rag_service,
-                        new_article.article_id,
-                        body,
-                        entry.title,
-                        entry.link,
-                        new_article.category,
-                        str(article_pubdate)
-                    )
-
-                    new_ref = ArticleReference(
-                        article_id=new_article.article_id,
-                        source_url=entry.link,
-                        published_date=article_pubdate,
-                        source_name=source,
-                        bias=info["bias"]
-                    )
-
-                    db.add(new_ref)
-
-                db.commit()
+                is_duplicate, article = await fast_duplicate_check(
+                    db=db,
+                    title=entry.title,
+                    body=body,
+                    source_url=entry.link,
+                    source_bias=info["bias"],
+                    source_name=source,
+                    published_date=article_pubdate,
+                    category= category,
+                    image_url=news.top_image,
+                    send_to_rag_fn=send_to_rag_service,
+                )
 
             except Exception as e:
                 print(f"Error scraping {entry.link}: {e}")
                 continue
-
-            count += 1
     
     return {"message" : "Scraping completed"}
 
@@ -265,7 +208,20 @@ def getArticleById(id: int, db: Session = Depends(get_db)):
         if article is None:
             raise HTTPException(status_code=404, detail="Article not found")
         
-        return article
+        return {
+            "article_id": article.article_id,
+            "title": article.title,
+            "summary": article.summary,
+            "category": article.category,
+            "image_url": article.image_url,
+            "left_bias": article.left_bias,
+            "center_bias": article.center_bias,
+            "right_bias": article.right_bias,
+            "created_at": article.created_at.isoformat() if article.created_at else None,
+            "views": article.views,
+            "sources": article.sources,
+        }
+
     except Exception as e:
         print(f"Error: {e}")
 

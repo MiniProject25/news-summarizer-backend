@@ -2,6 +2,7 @@ from sqlalchemy import Column, Integer, Text, String, TIMESTAMP, ForeignKey, Dat
 from sqlalchemy.orm import relationship
 from datetime import datetime
 from config.database import Base
+from pgvector.sqlalchemy import Vector
 
 class Article(Base):
     __tablename__ = "articles"
@@ -16,7 +17,8 @@ class Article(Base):
     center_bias = Column(Integer)
     created_at = Column(TIMESTAMP, default=datetime.utcnow())
     views = Column(Integer, default=0)
-    content_hash = Column(Text, unique=True)
+
+    embedding = Column(Vector(768))
 
         # relationship with references
     sources = relationship("ArticleReference", back_populates="article", cascade="all, delete-orphan")

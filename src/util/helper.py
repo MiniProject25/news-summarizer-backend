@@ -2,13 +2,15 @@ import re, unicodedata
 import hashlib
 import json
 from pathlib import Path
-from transformers import pipeline, AutoModelForSequenceClassification, AutoTokenizer
+from transformers import pipeline, AutoModelForSequenceClassification, AutoTokenizer, AutoModelForCausalLM, AutoTokenizer
 from sentence_transformers import SentenceTransformer, util
 from nltk.tokenize import sent_tokenize
 import torch
 import nltk
 import os
 from functools import lru_cache
+import language_tool_python
+
 nltk.download("punkt", quiet=True)
 
 # =====================================================
@@ -40,7 +42,7 @@ def save_cache(name: str, data: dict):
 #  MODEL INITIALIZATION
 # =====================================================
 
-RELATIVE_MODEL_PATH = Path(__file__).parent.parent / "models" / "fine-tuned-bart"
+RELATIVE_MODEL_PATH = Path(__file__).parent.parent / "models" / "fine-tuned-t5"
 MODEL_PATH = str(RELATIVE_MODEL_PATH.resolve())
 summarizer = pipeline("summarization", model=MODEL_PATH, tokenizer=MODEL_PATH, framework="pt")
 
@@ -54,64 +56,65 @@ nli_model = AutoModelForSequenceClassification.from_pretrained(nli_model_name, t
 
 sim_model = SentenceTransformer("all-MiniLM-L6-v2")
 
+# PHI_MODEL = "microsoft/phi-3-mini-4k-instruct"
+
+# phi_tokenizer = AutoTokenizer.from_pretrained(PHI_MODEL)
+# phi_model = AutoModelForCausalLM.from_pretrained(
+#     PHI_MODEL,
+#     torch_dtype="auto",
+#     device_map="auto"
+# )
+
 # =====================================================
 #  CLEANING
 # =====================================================
 
-def clean_article(text: str) -> str:
-    """Aggressive text cleanup: removes junk, metadata, boilerplate."""
-    if not isinstance(text, str) or not text.strip():
-        return ""
+import re
+import nltk
+from nltk.tokenize import sent_tokenize
 
-    # Normalize Unicode characters first
-    text = unicodedata.normalize("NFKC", text)
-    
-    # Remove invisible and special whitespace chars
-    text = re.sub(r'[\u200B-\u200D\uFEFF]', '', text)
-    
-    # Replace common HTML entities
-    text = re.sub(r"&nbsp;|&amp;|&lt;|&gt;", " ", text)
+def clean_article_max_strict(text: str) -> str:
+    # Normalize spaces
+    text = re.sub(r'\s+', ' ', text).strip()
 
-    # Remove photo credits, agencies, etc.
-    text = re.sub(r"(?i)\b(FILE PHOTO|NOTE TO USER|AP Photo|Getty Images|Reuters|AFP|Shutterstock|Courtesy of)\b.*", "", text)
-    
-    # Remove leading date/location headers
-    text = re.sub(r"^\s*[-–—]*\s*[A-Z\s,.'’\-]+ - ", "", text)
-    text = re.sub(r"^\s*(?:[A-Z]+\s+\d{1,2}:|[A-Z][a-z]+,\s*[A-Z][a-z]+\s*-\s*)", "", text)
+    # Remove common photo-credit patterns
+    text = re.sub(r'(via|WireImage|FilmMagic|Getty Images|Image Group|Shutterstock)[^.,;]*', '', text, flags=re.IGNORECASE)
 
-    # Remove bylines
-    text = re.sub(r"By\s+[A-Z][A-Za-z\s\.,'’\-]{1,80}", "", text)
+    # Force sentence tokenization
+    sentences = sent_tokenize(text)
 
-    # Remove photo/video captions
-    text = re.sub(r"\((Photo|Image|Video) by .*?\)", "", text, flags=re.IGNORECASE)
+    cleaned = []
 
-    # Remove URLs, tags, and mentions
-    text = re.sub(r"https?://\S+|@[A-Za-z0-9_]+|#[A-Za-z0-9_]+", "", text)
+    for s in sentences:
+        s_strip = s.strip()
 
-    # Remove boilerplate/news site sections
-    text = re.sub(
-        r"(?i)\b(MORE FOR YOU|READ MORE|SEE ALSO|TOP STORIES|TRENDING|RECOMMENDED|WATCH NOW|ADVERTISEMENT|SPONSORED)\b.*",
-        "", text)
-    text = re.sub(r"(All rights reserved|This material may not be published|Advertisement).*", "", text, flags=re.IGNORECASE)
+        # Remove all-caps or title-case blocks (caption-like)
+        if re.match(r'^[A-Z\s]{8,}$', s_strip):
+            continue
 
-    # Normalize dashes, but keep quotes
-    text = re.sub(r"–|—", "-", text)
-    text = re.sub(r"[\[\]<>]", "", text)  # removed () from here to keep quotes safe
+        # Remove lines starting with photo/date/location formats
+        if re.match(r'^(HOLLYWOOD|LOS ANGELES|NEW YORK|CALIFORNIA|NOVEMBER|DECEMBER|JANUARY|PHOTO).{0,40}:', s_strip, flags=re.IGNORECASE):
+            continue
 
-    # Fix spaces around punctuation
-    text = re.sub(r"\s([?.!,;:])", r"\1", text)
+        # Remove malformed OCR-like fragments with too many capitalized words
+        if len(re.findall(r'\b[A-Z][a-z]*\b', s_strip)) > 6:
+            continue
 
-    # Remove non-ASCII replacement chars but preserve smart quotes
-    text = text.encode("utf-8", "replace").decode("utf-8")
-    text = re.sub(r"[�\uFFFD]+", "", text)
+        # Sentence MUST contain a verb
+        if not re.search(r'\b(is|was|were|are|be|has|have|had|said|says|told|made|won|plays|attended|received|announced)\b', s_strip, flags=re.IGNORECASE):
+            continue
 
-    # Collapse extra spaces
-    text = re.sub(r"\s+", " ", text).strip()
+        # Sentence must contain at least one noun
+        if not re.search(r'\b[A-Za-z]+', s_strip):
+            continue
 
-    # Fix truncated endings like ". word"
-    text = re.sub(r"\.\s*\w*$", ".", text)
-    
-    return text.strip()
+        # Remove extremely short / empty lines
+        if len(s_strip.split()) < 6:
+            continue
+
+        cleaned.append(s_strip)
+
+    return " ".join(cleaned)
 
 # =====================================================
 #  FACTUALITY + SEMANTIC CHECKS (CACHED)
@@ -161,48 +164,76 @@ def is_relevant(article: str, sentence: str, min_sim: float = 0.45) -> bool:
 #  SUMMARIZATION
 # =====================================================
 
-def summarize_text(body: str) -> str:
-    """Generates a clean, factual paragraph summary."""
-    if not summarizer:
-        return "Model not loaded"
+def summarize_text(body: str) -> dict:
+    """Short, accurate summary (1–2 sentences)."""
 
-    body = clean_article(body)
+    if not summarizer:
+        return ""
+
+    body = clean_article_max_strict(body)
     if not body:
         return ""
 
-    # --- Chunking: break only if absolutely necessary ---
+    # --- Smaller chunks = shorter + more accurate ---
     sentences = sent_tokenize(body)
-    chunks, current_chunk = [], ""
-    for s in sentences:
-        if len(current_chunk.split()) + len(s.split()) < 450:  # ~512 token cap
-            current_chunk += " " + s
-        else:
-            chunks.append(current_chunk.strip())
-            current_chunk = s
-    if current_chunk:
-        chunks.append(current_chunk.strip())
+    chunks, current = [], []
 
-    # --- Summarize each chunk ---
+    for s in sentences:
+        if sum(len(x.split()) for x in current) + len(s.split()) < 180:
+            current.append(s)
+        else:
+            chunks.append(" ".join(current).strip())
+            current = [s]
+
+    if current:
+        chunks.append(" ".join(current).strip())
+
+    # --- Summaries (tight + factual) ---
     partials = []
     for ch in chunks:
-        summary = summarizer(
-            ch,
-            max_length=200,       # same as model.generate max_length
-            min_length=60,        # same as model.generate min_length
-            num_beams=4,          # beam search width
-            length_penalty=2.0,   # discourage very long outputs
-            early_stopping=True,  # stop when beams end
-            do_sample=False       # deterministic, same as beam search
+        prompt = (
+            "Summarize accurately in 1–2 concise sentences. "
+            "No extra details, no speculation: "
+        )
+
+        out = summarizer(
+            prompt + ch,
+            max_length=60,      # short output
+            min_length=20,      # avoids over-cutting
+            num_beams=6,        # accuracy boost
+            no_repeat_ngram_size=3,
+            do_sample=False,
+            early_stopping=True
         )[0]["summary_text"].strip()
-        partials.append(summary)
 
-    # --- Merge summaries into one coherent paragraph ---
-    combined = " ".join(partials)
-    combined = re.sub(r"\s+", " ", combined).strip()
+        out = trim_to_sentence(out)
+        partials.append(out)
 
-    bullets = re.split(r'(?<=[.!?])\s+', combined)
-    bullets = [b.strip() for b in bullets if len(b.split()) > 5]
-    return "\n- " + "\n- ".join(bullets[:5])
+    # Join, clean, finalise
+    raw = " ".join(partials)
+    raw = re.sub(r"\s+", " ", raw).strip()
+    raw = trim_to_sentence(raw)
+
+    if raw:
+        raw = raw[0].upper() + raw[1:]
+
+    return raw
+
+tool = language_tool_python.LanguageTool('en-US')
+
+def fast_refine(summary: str) -> str:
+    if not summary.strip():
+        return summary
+    summary = summary.replace("\n", " ").strip()
+    corrected = tool.correct(summary)
+    return corrected
+
+def trim_to_sentence(text: str) -> str:
+    text = text.strip()
+    last_punct = max(text.rfind("."), text.rfind("?"), text.rfind("!"))
+    if last_punct != -1:
+        return text[: last_punct + 1]
+    return text
 
 # =====================================================
 #  SAFE EXIT HOOK — Auto-save cache
