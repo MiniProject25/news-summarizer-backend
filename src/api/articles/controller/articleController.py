@@ -17,6 +17,8 @@ from util.deduplication_check import fast_duplicate_check
 from util.helper import clean_article_max_strict, compute_hash, summarize_text
 from util.articleHelper import categorize, send_to_rag_service
 import asyncio
+import requests
+from bs4 import BeautifulSoup
 
 router = APIRouter() 
 
@@ -77,12 +79,11 @@ def getAllArticles(
 async def scrapeArticles(
     limit: int = 4, # for the purpose of smoke test
     db: Session = Depends(get_db),
-    background_tasks: BackgroundTasks = None
 ):
     feeds = {
         # "Bloomberg" : { "url" : "https://www.bloomberg.com/feed/podcast/etf-report.xml", "bias" : "left" },
-        "Forbes" : {"url" : "https://www.forbes.com/business/feed/", "bias" : "center"},
-        # "CNBC" : {"url" : "https://www.cnbc.com/id/100003114/device/rss/rss.html", "bias" : "left"},
+        # "Forbes" : {"url" : "https://www.forbes.com/business/feed/", "bias" : "center"},
+        "CNBC" : {"url" : "https://www.cnbc.com/id/100003114/device/rss/rss.html", "bias" : "left"},
         # "Financial Times" : {"url" : "https://www.ft.com/?format=rss", "bias" : "center"}, 
         # "The Economist" : {"url" : "https://www.economist.com/latest/rss.xml", "bias" : "left"}, 
         # "Harvard Business Reviews" : {"url" : "https://hbr.org/feed", "bias" : "center"}, 
@@ -113,8 +114,9 @@ async def scrapeArticles(
             count += 1
             
             try:
+                url = entry.link
                 # fetch article body
-                news = NewsArticle(entry.link, config=config)
+                news = NewsArticle(url, config=config)
 
                 article_pubdate = None
                 if hasattr(entry, "published_parsed") and entry.published_parsed:
@@ -128,28 +130,68 @@ async def scrapeArticles(
                     print(f"Skipping {entry.link}: parse failed ({e})")
                     continue
 
-                body = await asyncio.to_thread(lambda: news.text.strip())
+                try:
+                    headers = {
+                        "User-Agent": config.browser_user_agent
+                    }
+                    raw_html = requests.get(url, headers=headers, timeout=10).text
+                except Exception as e:
+                    print(f"Failed HTML fetch {url} ({e})")
+                    continue
 
-                if not body:
-                    print(f"Empty body for {entry.link}")
+                clean_body = None
+
+                try:
+                    import trafilatura
+                    clean_body = trafilatura.extract(
+                        raw_html,
+                        include_comments=False,
+                        favor_recall=False
+                    )
+                except:
+                    clean_body = None
+
+                if not clean_body:
+                    try:
+                        from readability import Document
+                        clean_body = BeautifulSoup(
+                            Document(raw_html).summary(), 
+                            "lxml"
+                        ).get_text("\n")
+                    except:
+                        clean_body = None
+
+                if not clean_body:
+                    try:
+                        from boilerpy3 import extractors
+                        extractor = extractors.ArticleExtractor()
+                        clean_body = extractor.get_content(raw_html)
+                    except:
+                        clean_body = None
+
+                if not clean_body:
+                    clean_body = news.text
+
+                if not clean_body or len(clean_body.strip()) < 100:
+                    print(f"Body extraction failed or too short → {url}")
                     continue
 
                 # print("Body before Cleaning: ")
                 # print(body)
                 
                 # clean article body
-                body = clean_article_max_strict(news.text)
+                clean_body = clean_article_max_strict(clean_body)
 
                 # print("Body after cleaning: ")
                 # print(body)
 
-                category = await categorize(body)
+                category = await categorize(clean_body)
 
                 is_duplicate, article = await fast_duplicate_check(
                     db=db,
                     title=entry.title,
-                    body=body,
-                    source_url=entry.link,
+                    body=clean_body,
+                    source_url=url,
                     source_bias=info["bias"],
                     source_name=source,
                     published_date=article_pubdate,
@@ -267,3 +309,53 @@ async def get_similar_articles(article_id: int, n: int = 5):
         except Exception as e:
             logging.exception("Failed to fetch similar articles")
             return {"error": str(e)}
+
+## ROUTE to fetch source breakdown for an article of id
+@router.get("/source-breakdown/{article_id}")
+async def get_breakdown(article_id: int, db: Session = Depends(get_db)):
+    article = db.query(Article).filter(Article.article_id == article_id).first()
+    if not article:
+        raise HTTPException(status_code=404, detail="Article not found")
+    
+    sources = (
+        db.query(ArticleReference)
+        .filter(ArticleReference.article_id == article_id)
+        .all()
+    )
+
+    left = []
+    center = []
+    right = []
+
+    ## sort them into the arrays
+    for src in sources:
+        item = {
+            "name": src.source_name,
+            "url": src.source_url,
+            "publication_date": (
+                src.published_date.isoformat() if src.published_date else ""
+            )
+        }
+
+        if src.bias == "left":
+            left.append(item)
+        elif src.bias == "center":
+            center.append(item)
+        elif src.bias == "right":
+            right.append(item)
+
+    return {
+        "left": left,
+        "center": center,
+        "right": right
+    }
+
+## ROUTE to fetch articles by category
+@router.get("by-category")
+async def get_articles_by_category(category: str, db: Session = Depends(get_db)):
+    return(
+        db.query(Article)
+        .filter(Article.category.ilike(category))
+        .order_by(Article.created_at.desc())
+        .all()
+    )

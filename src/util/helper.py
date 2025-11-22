@@ -74,47 +74,59 @@ import nltk
 from nltk.tokenize import sent_tokenize
 
 def clean_article_max_strict(text: str) -> str:
+    # --- 1. Protect decimals like 7.8 or 2.4 ---
+    text = re.sub(r"(\d)\.(\d)", r"\1DECIMAL\2", text)
+
     # Normalize spaces
     text = re.sub(r'\s+', ' ', text).strip()
 
-    # Remove common photo-credit patterns
-    text = re.sub(r'(via|WireImage|FilmMagic|Getty Images|Image Group|Shutterstock)[^.,;]*', '', text, flags=re.IGNORECASE)
+    # Remove photo-credits / agency fluff
+    text = re.sub(
+        r'(via|WireImage|FilmMagic|Getty Images|Image Group|Shutterstock)[^.,;]*',
+        '',
+        text,
+        flags=re.IGNORECASE
+    )
 
-    # Force sentence tokenization
     sentences = sent_tokenize(text)
-
     cleaned = []
 
     for s in sentences:
         s_strip = s.strip()
 
-        # Remove all-caps or title-case blocks (caption-like)
+        # Remove all-caps captions
         if re.match(r'^[A-Z\s]{8,}$', s_strip):
             continue
 
-        # Remove lines starting with photo/date/location formats
-        if re.match(r'^(HOLLYWOOD|LOS ANGELES|NEW YORK|CALIFORNIA|NOVEMBER|DECEMBER|JANUARY|PHOTO).{0,40}:', s_strip, flags=re.IGNORECASE):
+        # Remove location/photo metadata
+        if re.match(
+            r'^(HOLLYWOOD|LOS ANGELES|NEW YORK|CALIFORNIA|NOVEMBER|DECEMBER|JANUARY|PHOTO).{0,40}:',
+            s_strip,
+            flags=re.IGNORECASE
+        ):
             continue
 
-        # Remove malformed OCR-like fragments with too many capitalized words
-        if len(re.findall(r'\b[A-Z][a-z]*\b', s_strip)) > 6:
-            continue
+        # --- 2. Keep business sentences even if they lack a verb, as long as numbers appear ---
+        if not re.search(r'\d', s_strip):
+            # If no numbers, require verbs
+            if not re.search(
+                r'\b(is|was|were|are|be|has|have|had|said|says|told|made|won|plays|attended|received|announced|estimated|expected|reported|grew|grows|rises|rose|falls|fell)\b',
+                s_strip,
+                flags=re.IGNORECASE
+            ):
+                continue
 
-        # Sentence MUST contain a verb
-        if not re.search(r'\b(is|was|were|are|be|has|have|had|said|says|told|made|won|plays|attended|received|announced)\b', s_strip, flags=re.IGNORECASE):
-            continue
-
-        # Sentence must contain at least one noun
-        if not re.search(r'\b[A-Za-z]+', s_strip):
-            continue
-
-        # Remove extremely short / empty lines
-        if len(s_strip.split()) < 6:
+        # At least 5 words
+        if len(s_strip.split()) < 5:
             continue
 
         cleaned.append(s_strip)
 
-    return " ".join(cleaned)
+    # Restore decimals
+    final_text = " ".join(cleaned)
+    final_text = final_text.replace("DECIMAL", ".")
+
+    return final_text
 
 # =====================================================
 #  FACTUALITY + SEMANTIC CHECKS (CACHED)
@@ -163,9 +175,10 @@ def is_relevant(article: str, sentence: str, min_sim: float = 0.45) -> bool:
 # =====================================================
 #  SUMMARIZATION
 # =====================================================
+T5_PREFIX = "summarize: Produce a very short, factual, bias-free, 1–2 sentence news summary: "
 
-def summarize_text(body: str) -> dict:
-    """Short, accurate summary (1–2 sentences)."""
+def summarize_text(body: str) -> str:
+    """Ultra-short, factual 1–2 sentence summary."""
 
     if not summarizer:
         return ""
@@ -174,33 +187,32 @@ def summarize_text(body: str) -> dict:
     if not body:
         return ""
 
-    # --- Smaller chunks = shorter + more accurate ---
+    # --- Smaller chunks = shorter + tighter summaries ---
     sentences = sent_tokenize(body)
     chunks, current = [], []
 
     for s in sentences:
-        if sum(len(x.split()) for x in current) + len(s.split()) < 180:
+        if sum(len(x.split()) for x in current) + len(s.split()) < 80:
             current.append(s)
         else:
             chunks.append(" ".join(current).strip())
             current = [s]
-
     if current:
         chunks.append(" ".join(current).strip())
 
-    # --- Summaries (tight + factual) ---
     partials = []
     for ch in chunks:
         prompt = (
-            "Summarize accurately in 1–2 concise sentences. "
-            "No extra details, no speculation: "
+            "summarize: Produce an extremely concise factual summary. "
+            "Only capture the core point. "
+            "Limit to one short sentence if possible. No elaboration: "
         )
 
         out = summarizer(
             prompt + ch,
-            max_length=60,      # short output
-            min_length=20,      # avoids over-cutting
-            num_beams=6,        # accuracy boost
+            max_length=60,
+            min_length=15,
+            num_beams=4,
             no_repeat_ngram_size=3,
             do_sample=False,
             early_stopping=True
@@ -209,11 +221,24 @@ def summarize_text(body: str) -> dict:
         out = trim_to_sentence(out)
         partials.append(out)
 
-    # Join, clean, finalise
+    # Join + tighten to max 2 sentences
     raw = " ".join(partials)
     raw = re.sub(r"\s+", " ", raw).strip()
     raw = trim_to_sentence(raw)
 
+    # If summary somehow becomes long → compress once more
+    if len(raw.split()) > 35:  # ~2 sentences limit
+        raw = summarizer(
+            "summarize: " + raw,
+            max_length=40,
+            min_length=15,
+            num_beams=4,
+            no_repeat_ngram_size=3,
+            do_sample=False
+        )[0]["summary_text"].strip()
+        raw = trim_to_sentence(raw)
+
+    # Capitalize
     if raw:
         raw = raw[0].upper() + raw[1:]
 
